@@ -33,16 +33,6 @@ function getTrackTables() {
     .filter((name) => /^locus\d{8}$/.test(name));
 }
 
-function assertTrackTable(table) {
-  const tables = getTrackTables();
-  if (!tables.includes(table)) {
-    const error = new Error(`Unknown track table: ${table}`);
-    error.status = 400;
-    throw error;
-  }
-  return table;
-}
-
 function q(name) {
   return `"${name.replaceAll('"', '""')}"`;
 }
@@ -56,23 +46,50 @@ function colorForMmsi(mmsi) {
   return `hsl(${hue}, 78%, 52%)`;
 }
 
-function sourceSql(range) {
+function sourceSql() {
   const tables = getTrackTables();
-  if (range && range !== 'all') {
-    const table = assertTrackTable(range);
-    return {
-      label: table,
-      sql: `SELECT * FROM ${q(table)}`
-    };
-  }
-
-  return {
-    label: 'all',
-    sql: tables.map((table) => `SELECT * FROM ${q(table)}`).join(' UNION ALL ')
-  };
+  return tables.map((table) => `SELECT * FROM ${q(table)}`).join(' UNION ALL ');
 }
 
-function tableStats(table) {
+function normalizeTimeInput(value) {
+  if (!value) return null;
+  const input = String(value).trim();
+  const match = input.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2})(?::?(\d{2}))?(?::?(\d{2}))?$/);
+  if (!match) {
+    const error = new Error(`Invalid datetime: ${value}`);
+    error.status = 400;
+    throw error;
+  }
+
+  const [, date, hour, minute = '00', second = '00'] = match;
+  return `${date} ${hour}:${minute}:${second}`;
+}
+
+function getTimeWindow(req) {
+  const start = normalizeTimeInput(req.query.start);
+  const end = normalizeTimeInput(req.query.end);
+  if (start && end && start > end) {
+    const error = new Error('start must be earlier than or equal to end');
+    error.status = 400;
+    throw error;
+  }
+  return { start, end };
+}
+
+function buildTimeClause(alias, window, params) {
+  const conditions = [];
+  if (window.start) {
+    conditions.push(`${alias}.jssj >= ?`);
+    params.push(window.start);
+  }
+  if (window.end) {
+    conditions.push(`${alias}.jssj <= ?`);
+    params.push(window.end);
+  }
+  return conditions.length ? ` AND ${conditions.join(' AND ')}` : '';
+}
+
+function getGlobalBounds() {
   return db
     .prepare(
       `SELECT
@@ -84,7 +101,7 @@ function tableStats(table) {
         MIN(zbwd) AS minLat,
         MAX(zbjd) AS maxLon,
         MAX(zbwd) AS maxLat
-      FROM ${q(table)}`
+      FROM (${sourceSql()})`
     )
     .get();
 }
@@ -93,39 +110,12 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, dbPath });
 });
 
-app.get('/api/time-options', (_req, res, next) => {
+app.get('/api/time-bounds', (_req, res, next) => {
   try {
-    const tables = getTrackTables();
-    const options = tables.map((table) => {
-      const stat = tableStats(table);
-      const date = table.slice('locus'.length).replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
-      return {
-        value: table,
-        label: date,
-        table,
-        ...stat
-      };
-    });
-
-    const allStats = db
-      .prepare(
-        `SELECT
-          COUNT(*) AS rows,
-          COUNT(DISTINCT mmsi) AS ships,
-          MIN(jssj) AS minTime,
-          MAX(jssj) AS maxTime,
-          MIN(zbjd) AS minLon,
-          MIN(zbwd) AS minLat,
-          MAX(zbjd) AS maxLon,
-          MAX(zbwd) AS maxLat
-        FROM (${tables.map((table) => `SELECT * FROM ${q(table)}`).join(' UNION ALL ')})`
-      )
-      .get();
-
+    const bounds = getGlobalBounds();
     res.json({
       dbPath,
-      defaultValue: tables.at(-1) || 'all',
-      options: [{ value: 'all', label: '全部时间', table: null, ...allStats }, ...options]
+      ...bounds
     });
   } catch (error) {
     next(error);
@@ -135,14 +125,16 @@ app.get('/api/time-options', (_req, res, next) => {
 app.get('/api/ships/search', (req, res, next) => {
   try {
     const keyword = String(req.query.q || '').trim();
-    const range = String(req.query.range || 'all');
     if (!keyword) {
       res.json({ results: [] });
       return;
     }
 
-    const source = sourceSql(range);
+    const window = getTimeWindow(req);
     const like = `%${keyword.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
+    const params = [like, like, like];
+    const timeClause = buildTimeClause('l', window, params);
+
     const results = db
       .prepare(
         `SELECT
@@ -151,16 +143,18 @@ app.get('/api/ships/search', (req, res, next) => {
           COUNT(*) AS pointCount,
           MIN(l.jssj) AS minTime,
           MAX(l.jssj) AS maxTime
-        FROM (${source.sql}) l
+        FROM (${sourceSql()}) l
         LEFT JOIN ship s ON s.mmsi = l.mmsi
-        WHERE l.mmsi LIKE ? ESCAPE '\\'
-           OR s.zwmc LIKE ? ESCAPE '\\'
-           OR s.cbmc LIKE ? ESCAPE '\\'
+        WHERE (
+          l.mmsi LIKE ? ESCAPE '\\'
+          OR s.zwmc LIKE ? ESCAPE '\\'
+          OR s.cbmc LIKE ? ESCAPE '\\'
+        )${timeClause}
         GROUP BY l.mmsi, shipName
         ORDER BY pointCount DESC, l.mmsi
         LIMIT 20`
       )
-      .all(like, like, like);
+      .all(...params);
 
     res.json({ results });
   } catch (error) {
@@ -170,8 +164,10 @@ app.get('/api/ships/search', (req, res, next) => {
 
 app.get('/api/tracks', (req, res, next) => {
   try {
-    const range = String(req.query.range || req.query.table || 'all');
-    const source = sourceSql(range);
+    const window = getTimeWindow(req);
+    const params = [];
+    const timeClause = buildTimeClause('l', window, params);
+
     const rows = db
       .prepare(
         `SELECT
@@ -184,15 +180,15 @@ app.get('/api/tracks', (req, res, next) => {
           l.cbcs,
           l.class_type AS classType,
           COALESCE(NULLIF(s.zwmc, ''), NULLIF(s.cbmc, ''), l.mmsi) AS shipName
-        FROM (${source.sql}) l
+        FROM (${sourceSql()}) l
         LEFT JOIN ship s ON s.mmsi = l.mmsi
         WHERE l.zbjd IS NOT NULL
           AND l.zbwd IS NOT NULL
           AND l.zbjd BETWEEN -180 AND 180
-          AND l.zbwd BETWEEN -90 AND 90
+          AND l.zbwd BETWEEN -90 AND 90${timeClause}
         ORDER BY l.mmsi, l.jssj`
       )
-      .all();
+      .all(...params);
 
     const ships = new Map();
     const pointFeatures = [];
@@ -200,18 +196,20 @@ app.get('/api/tracks', (req, res, next) => {
     let minLat = Infinity;
     let maxLon = -Infinity;
     let maxLat = -Infinity;
+    let minTime = null;
+    let maxTime = null;
 
     for (const row of rows) {
       const lon = Number(row.zbjd);
       const lat = Number(row.zbwd);
-      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
-        continue;
-      }
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
 
       minLon = Math.min(minLon, lon);
       minLat = Math.min(minLat, lat);
       maxLon = Math.max(maxLon, lon);
       maxLat = Math.max(maxLat, lat);
+      minTime = minTime ? (row.jssj < minTime ? row.jssj : minTime) : row.jssj;
+      maxTime = maxTime ? (row.jssj > maxTime ? row.jssj : maxTime) : row.jssj;
 
       const mmsi = String(row.mmsi);
       const color = colorForMmsi(mmsi);
@@ -287,13 +285,15 @@ app.get('/api/tracks', (req, res, next) => {
         : null;
 
     res.json({
-      range: source.label,
+      window,
       summary: {
         rows: pointFeatures.length,
         ships: ships.size,
         lines: lineFeatures.length,
         labels: labelFeatures.length,
-        bbox
+        bbox,
+        minTime,
+        maxTime
       },
       lines: { type: 'FeatureCollection', features: lineFeatures },
       points: { type: 'FeatureCollection', features: pointFeatures },

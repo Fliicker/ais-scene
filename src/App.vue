@@ -9,9 +9,20 @@ const apiUrl = (path) => `${apiBaseUrl}${path}`;
 const formatNumber = (value) => new Intl.NumberFormat('zh-CN').format(value || 0);
 const emptyCollection = () => ({ type: 'FeatureCollection', features: [] });
 
+function dbToInput(value) {
+  if (!value) return '';
+  return value.slice(0, 13).replace(' ', 'T') + ':00';
+}
+
+function inputToDb(value) {
+  if (!value) return '';
+  return `${value.replace('T', ' ')}:00`;
+}
+
 const mapEl = ref(null);
-const options = ref([]);
-const selectedRange = ref('all');
+const startTime = ref('');
+const endTime = ref('');
+const bounds = ref(null);
 const viewMode = ref('tracks');
 const loading = ref(false);
 const error = ref('');
@@ -41,9 +52,10 @@ const viewModes = [
   { value: 'hybrid', label: '叠加' }
 ];
 
-const selectedOption = computed(() =>
-  options.value.find((item) => item.value === selectedRange.value)
-);
+const timeWindowLabel = computed(() => {
+  if (!startTime.value || !endTime.value) return '';
+  return `${startTime.value.replace('T', ' ')} 至 ${endTime.value.replace('T', ' ')}`;
+});
 
 const focusSummary = computed(() => {
   if (!focusedMmsi.value) return '';
@@ -74,7 +86,6 @@ function decorateCollection(collection) {
       const mmsi = nextFeature.properties?.mmsi || '';
       nextFeature.properties.isFocused = hasFocus && mmsi === focusedMmsi.value;
       nextFeature.properties.isDimmed = hasFocus && mmsi !== focusedMmsi.value;
-      nextFeature.properties.heatWeight = 1;
       return nextFeature;
     })
   };
@@ -110,12 +121,9 @@ function applyViewMode() {
 
 function applyLayerFilters() {
   if (!map?.getLayer('track-points')) return;
-
   const focusFilter = focusedMmsi.value ? ['==', ['get', 'mmsi'], focusedMmsi.value] : null;
   map.setFilter('track-points', focusFilter);
-  if (map.getLayer('track-heatmap')) {
-    map.setFilter('track-heatmap', focusFilter);
-  }
+  if (map.getLayer('track-heatmap')) map.setFilter('track-heatmap', focusFilter);
 }
 
 function applyRenderedData() {
@@ -153,16 +161,12 @@ function updatePopup(event, html) {
 function getPreferredFeature(point) {
   if (!map || viewMode.value === 'heatmap') return null;
 
-  const pointFeature = map.queryRenderedFeatures(point, {
-    layers: ['track-points']
-  })[0];
+  const pointFeature = map.queryRenderedFeatures(point, { layers: ['track-points'] })[0];
   if (pointFeature && canShowPopup(pointFeature.properties)) {
     return { type: 'point', feature: pointFeature };
   }
 
-  const lineFeature = map.queryRenderedFeatures(point, {
-    layers: ['track-lines']
-  })[0];
+  const lineFeature = map.queryRenderedFeatures(point, { layers: ['track-lines'] })[0];
   if (lineFeature && canShowPopup(lineFeature.properties)) {
     return { type: 'line', feature: lineFeature };
   }
@@ -214,9 +218,23 @@ function setViewMode(nextMode) {
   viewMode.value = nextMode;
   applyViewMode();
   popup?.remove();
-  if (map) {
-    map.getCanvas().style.cursor = '';
+  if (map) map.getCanvas().style.cursor = '';
+}
+
+function validateTimeWindow() {
+  if (!startTime.value || !endTime.value) {
+    throw new Error('请选择开始时间和结束时间。');
   }
+  if (startTime.value > endTime.value) {
+    throw new Error('开始时间不能晚于结束时间。');
+  }
+}
+
+function currentWindowParams() {
+  return new URLSearchParams({
+    start: inputToDb(startTime.value),
+    end: inputToDb(endTime.value)
+  });
 }
 
 function addMapLayers() {
@@ -326,7 +344,6 @@ function addMapLayers() {
       updatePopup(event, getPointPopupHtml(hit.feature.properties));
       return;
     }
-
     updatePopup(event, getLinePopupHtml(hit.feature.properties));
   });
 
@@ -347,24 +364,25 @@ function addMapLayers() {
   });
 }
 
-async function loadOptions() {
-  const response = await fetch(apiUrl('/api/time-options'));
-  if (!response.ok) throw new Error(`时间选项加载失败: ${response.status}`);
-
+async function loadBounds() {
+  const response = await fetch(apiUrl('/api/time-bounds'));
+  if (!response.ok) throw new Error(`时间范围加载失败: ${response.status}`);
   const data = await response.json();
-  options.value = data.options || [];
-  selectedRange.value = data.defaultValue || options.value[0]?.value || 'all';
+  bounds.value = data;
+  startTime.value = dbToInput(data.minTime);
+  endTime.value = dbToInput(data.maxTime);
 }
 
 async function loadTracks() {
   if (!mapReady.value) return;
+  validateTimeWindow();
 
   const requestId = ++currentRequest;
   loading.value = true;
   error.value = '';
 
   try {
-    const response = await fetch(apiUrl(`/api/tracks?range=${encodeURIComponent(selectedRange.value)}`));
+    const response = await fetch(apiUrl(`/api/tracks?${currentWindowParams().toString()}`));
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
       throw new Error(detail?.error || `轨迹数据加载失败: ${response.status}`);
@@ -412,16 +430,22 @@ async function searchShips() {
   const keyword = searchQuery.value.trim();
   searchError.value = '';
   searchResults.value = [];
-
   if (!keyword) return;
+
+  try {
+    validateTimeWindow();
+  } catch (err) {
+    searchError.value = err.message || String(err);
+    return;
+  }
 
   const requestId = ++currentSearchRequest;
   searchLoading.value = true;
 
   try {
-    const response = await fetch(
-      apiUrl(`/api/ships/search?q=${encodeURIComponent(keyword)}&range=${encodeURIComponent(selectedRange.value)}`)
-    );
+    const params = currentWindowParams();
+    params.set('q', keyword);
+    const response = await fetch(apiUrl(`/api/ships/search?${params.toString()}`));
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
       throw new Error(detail?.error || `船舶搜索失败: ${response.status}`);
@@ -454,7 +478,7 @@ function selectSearchResult(result) {
   }
 }
 
-async function onRangeChange() {
+async function applyTimeWindow() {
   await loadTracks();
   if (searchQuery.value.trim()) {
     await searchShips();
@@ -490,7 +514,7 @@ onMounted(async () => {
     await nextTick();
 
     try {
-      await loadOptions();
+      await loadBounds();
       await loadTracks();
     } catch (err) {
       error.value = err.message || String(err);
@@ -509,19 +533,34 @@ onBeforeUnmount(() => {
     <div ref="mapEl" class="map"></div>
 
     <section class="control-panel" aria-label="轨迹控制面板">
-      <label class="field-label" for="range-select">时间范围</label>
-      <select id="range-select" v-model="selectedRange" class="range-select" @change="onRangeChange">
-        <option v-for="item in options" :key="item.value" :value="item.value">
-          {{ item.label }}
-        </option>
-      </select>
+      <label class="field-label" for="start-time">开始时间</label>
+      <input
+        id="start-time"
+        v-model="startTime"
+        class="time-input"
+        type="datetime-local"
+        step="3600"
+      />
 
-      <div v-if="selectedOption" class="meta-grid">
-        <span>轨迹点</span>
-        <strong>{{ formatNumber(selectedOption.rows) }}</strong>
-        <span>船舶数</span>
-        <strong>{{ formatNumber(selectedOption.ships) }}</strong>
+      <label class="field-label" for="end-time">结束时间</label>
+      <input
+        id="end-time"
+        v-model="endTime"
+        class="time-input"
+        type="datetime-local"
+        step="3600"
+      />
+
+      <button type="button" class="apply-button" @click="applyTimeWindow">应用时间范围</button>
+
+      <div v-if="bounds" class="meta-grid">
+        <span>全库起点</span>
+        <strong>{{ bounds.minTime }}</strong>
+        <span>全库终点</span>
+        <strong>{{ bounds.maxTime }}</strong>
       </div>
+
+      <div v-if="timeWindowLabel" class="meta-text">当前时间范围：{{ timeWindowLabel }}</div>
 
       <div class="search-panel">
         <label class="field-label">显示模式</label>
