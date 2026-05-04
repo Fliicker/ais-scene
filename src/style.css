@@ -164,6 +164,11 @@ body {
   font-weight: 700;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .toggle-button.active {
   border-color: #d84432;
   background: rgba(216, 68, 50, 0.1);

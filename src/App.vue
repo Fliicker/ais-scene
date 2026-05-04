@@ -16,6 +16,18 @@ function dbToInput(value) {
   return value.slice(0, 13).replace(' ', 'T') + ':00';
 }
 
+function dbToDate(value) {
+  if (!value) return null;
+  const date = new Date(value.replace(' ', 'T'));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function dateToInput(date) {
+  if (!date) return '';
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:00`;
+}
+
 function inputToDb(value) {
   if (!value) return '';
   return `${value.replace('T', ' ')}:00`;
@@ -122,17 +134,13 @@ function getDeckColor(feature, fallbackAlpha = 220) {
 
 function getRouteHeatColor(feature) {
   const density = Math.max(0, Math.min(1, feature?.properties?.normalizedDensity || 0));
-  if (density < 0.18) return [49, 130, 189, 95];
-  if (density < 0.36) return [65, 182, 196, 135];
-  if (density < 0.54) return [102, 194, 165, 175];
-  if (density < 0.72) return [254, 224, 139, 215];
-  if (density < 0.9) return [253, 141, 60, 238];
-  return [215, 48, 39, 255];
-}
-
-function getRouteHeatWidth(feature) {
-  const density = Math.max(0, Math.min(1, feature?.properties?.normalizedDensity || 0));
-  return 1 + density * 5;
+  if (density < 1 / 7) return [11, 112, 148, 245];
+  if (density < 2 / 7) return [0, 156, 88, 245];
+  if (density < 3 / 7) return [2, 203, 44, 245];
+  if (density < 4 / 7) return [23, 248, 34, 245];
+  if (density < 5 / 7) return [250, 255, 0, 245];
+  if (density < 6 / 7) return [255, 157, 0, 245];
+  return [234, 0, 0, 245];
 }
 
 function setCanvasCursor(cursor) {
@@ -170,7 +178,7 @@ function renderDeckLayers() {
           filled: false,
           lineWidthUnits: 'pixels',
           getLineColor: getRouteHeatColor,
-          getLineWidth: getRouteHeatWidth,
+          getLineWidth: 0.5,
           parameters: { depthTest: false }
         })
       ]
@@ -280,7 +288,13 @@ async function loadBounds() {
   if (!response.ok) throw new Error(`时间范围加载失败: ${response.status}`);
   const data = await response.json();
   bounds.value = data;
-  startTime.value = dbToInput(data.minTime);
+  const maxTime = dbToDate(data.maxTime);
+  if (maxTime) {
+    const start = new Date(maxTime.getTime() - 24 * 60 * 60 * 1000);
+    startTime.value = dateToInput(start);
+  } else {
+    startTime.value = dbToInput(data.minTime);
+  }
   endTime.value = dbToInput(data.maxTime);
 }
 
@@ -382,6 +396,7 @@ async function loadCurrentVisualization() {
 }
 
 async function toggleRouteHeatmap() {
+  if (loading.value) return;
   showRouteHeatmap.value = !showRouteHeatmap.value;
   setCanvasCursor('');
   await loadCurrentVisualization();
@@ -430,6 +445,7 @@ async function searchShips() {
 }
 
 function selectSearchResult(result) {
+  if (loading.value) return;
   const isSame = focusedMmsi.value === result.mmsi;
   focusedMmsi.value = isSame ? '' : result.mmsi;
   applyRenderedData();
@@ -440,6 +456,7 @@ function selectSearchResult(result) {
 }
 
 async function applyTimeWindow() {
+  if (loading.value) return;
   await loadCurrentVisualization();
   if (searchQuery.value.trim()) {
     await searchShips();
@@ -514,7 +531,7 @@ onBeforeUnmount(() => {
         step="3600"
       />
 
-      <button type="button" class="apply-button" @click="applyTimeWindow">应用时间范围</button>
+      <button type="button" class="apply-button" :disabled="loading" @click="applyTimeWindow">应用时间范围</button>
 
       <div v-if="bounds" class="meta-grid">
         <span>全库起点</span>
@@ -531,6 +548,7 @@ onBeforeUnmount(() => {
           type="button"
           class="toggle-button"
           :class="{ active: showRouteHeatmap }"
+          :disabled="loading"
           @click="toggleRouteHeatmap"
         >
           航线热力
@@ -546,12 +564,12 @@ onBeforeUnmount(() => {
             placeholder="输入 MMSI 或船名"
             @keydown.enter.prevent="searchShips"
           />
-          <button type="button" class="search-button" @click="searchShips">搜索</button>
+          <button type="button" class="search-button" :disabled="loading || searchLoading" @click="searchShips">搜索</button>
         </div>
 
         <div v-if="focusSummary" class="focus-banner">
           已聚焦 {{ focusSummary }}
-          <button type="button" class="text-button" @click="clearFocus">清除</button>
+          <button type="button" class="text-button" :disabled="loading" @click="clearFocus">清除</button>
         </div>
 
         <div v-if="searchLoading" class="meta-text">正在搜索船舶...</div>
@@ -563,6 +581,7 @@ onBeforeUnmount(() => {
               type="button"
               class="search-result"
               :class="{ active: focusedMmsi === result.mmsi }"
+              :disabled="loading"
               @click="selectSearchResult(result)"
             >
               <span class="search-result-name">{{ result.shipName }}</span>
@@ -577,9 +596,11 @@ onBeforeUnmount(() => {
         当前显示 {{ formatNumber(summary.lines) }} 条轨迹线，{{ formatNumber(summary.rows) }} 个轨迹点
       </div>
       <div v-else-if="summary" class="meta-text">
-        当前显示 {{ formatNumber(summary.segments) }} 条热力线段，最大密度 {{ summary.maxDensity?.toFixed?.(2) || '-' }}
+        当前显示 {{ formatNumber(summary.returnedSegments ?? summary.segments) }} / {{ formatNumber(summary.segments) }} 条热力线段，最大密度 {{ summary.maxDensity?.toFixed?.(2) || '-' }}
       </div>
-      <div v-if="loading" class="meta-text">正在加载轨迹数据...</div>
+      <div v-if="loading" class="meta-text">
+        {{ showRouteHeatmap ? '正在计算航线热力...' : '正在加载轨迹数据...' }}
+      </div>
       <div v-if="error" class="error-text">{{ error }}</div>
     </section>
   </main>

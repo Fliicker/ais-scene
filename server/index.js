@@ -23,9 +23,17 @@ const trackTables = getTrackTables();
 const routeDensityBandwidth = 150;
 const routeDensityRadius = 450;
 const earthRadiusMeters = 6378137;
+const trackPointLimit = positiveIntEnv('AIS_TRACK_POINT_LIMIT', 500000);
+const routeSegmentLimit = positiveIntEnv('AIS_ROUTE_SEGMENT_LIMIT', 500000);
+const routeDensityProgressStep = 50000;
 
 app.use(cors());
 app.use(compression());
+
+function positiveIntEnv(name, defaultValue) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : defaultValue;
+}
 
 function getTrackTables() {
   return db
@@ -128,6 +136,7 @@ function createRouteSegments(rows) {
 }
 
 function applyRouteDensity(segments, bandwidth = routeDensityBandwidth, radius = routeDensityRadius) {
+  const start = performance.now();
   const grid = new Map();
   const radiusSq = radius * radius;
   const bandwidthFactor = 2 * bandwidth * bandwidth;
@@ -136,8 +145,18 @@ function applyRouteDensity(segments, bandwidth = routeDensityBandwidth, radius =
   for (const segment of segments) {
     addToGrid(grid, segment, radius);
   }
+  console.log(
+    JSON.stringify({
+      route: '/api/route-segments',
+      stage: 'density-grid-ready',
+      cells: grid.size,
+      segments: segments.length,
+      elapsedMs: Math.round(performance.now() - start)
+    })
+  );
 
-  for (const segment of segments) {
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
     let density = 0;
     const buckets = nearbyBuckets(grid, segment.midX, segment.midY, radius, radius);
 
@@ -153,6 +172,20 @@ function applyRouteDensity(segments, bandwidth = routeDensityBandwidth, radius =
 
     segment.density = density;
     maxDensity = Math.max(maxDensity, density);
+
+    const processed = index + 1;
+    if (processed % routeDensityProgressStep === 0 || processed === segments.length) {
+      console.log(
+        JSON.stringify({
+          route: '/api/route-segments',
+          stage: 'density-progress',
+          processed,
+          total: segments.length,
+          percent: segments.length ? Number(((processed / segments.length) * 100).toFixed(2)) : 100,
+          elapsedMs: Math.round(performance.now() - start)
+        })
+      );
+    }
   }
 
   const maxLogDensity = Math.log1p(maxDensity);
@@ -332,6 +365,14 @@ app.get('/api/tracks', (req, res, next) => {
     const params = [];
     const timeClause = buildTimeClause('l', window, params);
 
+    console.log(
+      JSON.stringify({
+        route: '/api/route-segments',
+        stage: 'sql-start',
+        tables,
+        window
+      })
+    );
     const sqlStart = performance.now();
     const rows = db
       .prepare(
@@ -512,32 +553,54 @@ app.get('/api/route-segments', (req, res, next) => {
           AND l.zbwd IS NOT NULL
           AND l.zbjd BETWEEN -180 AND 180
           AND l.zbwd BETWEEN -90 AND 90${timeClause}
-        ORDER BY l.mmsi, l.jssj`
+        ORDER BY l.mmsi, l.jssj
+        LIMIT ${trackPointLimit}`
       )
       .all(...params);
     const sqlMs = performance.now() - sqlStart;
+    console.log(
+      JSON.stringify({
+        route: '/api/route-segments',
+        stage: 'sql-complete',
+        tables,
+        rows: rows.length,
+        elapsedMs: Math.round(sqlMs)
+      })
+    );
 
     const segmentStart = performance.now();
     const segments = createRouteSegments(rows);
     const segmentMs = performance.now() - segmentStart;
+    console.log(
+      JSON.stringify({
+        route: '/api/route-segments',
+        stage: 'segments-complete',
+        rows: rows.length,
+        segments: segments.length,
+        elapsedMs: Math.round(segmentMs)
+      })
+    );
 
     const densityStart = performance.now();
     const densitySummary = applyRouteDensity(segments);
     const densityMs = performance.now() - densityStart;
+    const returnedSegments = segments.slice(0, routeSegmentLimit);
 
     const payload = {
       window,
       summary: {
         rows: rows.length,
         segments: segments.length,
+        returnedSegments: returnedSegments.length,
         cells: densitySummary.cells,
         maxDensity: densitySummary.maxDensity,
         bandwidth: routeDensityBandwidth,
-        radius: routeDensityRadius
+        radius: routeDensityRadius,
+        segmentLimit: routeSegmentLimit
       },
       segments: {
         type: 'FeatureCollection',
-        features: segments.map(routeSegmentFeature)
+        features: returnedSegments.map(routeSegmentFeature)
       }
     };
     const responseStart = performance.now();
@@ -553,7 +616,8 @@ app.get('/api/route-segments', (req, res, next) => {
           responseMs: Math.round(performance.now() - responseStart),
           totalMs: Math.round(performance.now() - requestStart),
           dbRows: rows.length,
-          segments: segments.length
+          segments: segments.length,
+          returnedSegments: returnedSegments.length
         })
       );
     });
