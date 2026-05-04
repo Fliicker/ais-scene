@@ -1,6 +1,6 @@
 <script setup>
 import { MapboxOverlay } from '@deck.gl/mapbox';
-import { GeoJsonLayer, ScatterplotLayer } from '@deck.gl/layers';
+import { GeoJsonLayer } from '@deck.gl/layers';
 import mapboxgl from 'mapbox-gl';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 
@@ -29,6 +29,7 @@ const loading = ref(false);
 const error = ref('');
 const summary = ref(null);
 const mapReady = ref(false);
+const showRouteHeatmap = ref(false);
 const focusedMmsi = ref('');
 const searchQuery = ref('');
 const searchResults = ref([]);
@@ -46,6 +47,7 @@ const rawData = {
   points: emptyCollection(),
   labels: emptyCollection()
 };
+let routeSegments = emptyCollection();
 
 const timeWindowLabel = computed(() => {
   if (!startTime.value || !endTime.value) return '';
@@ -118,8 +120,19 @@ function getDeckColor(feature, fallbackAlpha = 220) {
   return parseColor(properties.color, fallbackAlpha);
 }
 
-function getPointCoordinates(feature) {
-  return feature?.geometry?.coordinates || null;
+function getRouteHeatColor(feature) {
+  const density = Math.max(0, Math.min(1, feature?.properties?.normalizedDensity || 0));
+  if (density < 0.18) return [49, 130, 189, 95];
+  if (density < 0.36) return [65, 182, 196, 135];
+  if (density < 0.54) return [102, 194, 165, 175];
+  if (density < 0.72) return [254, 224, 139, 215];
+  if (density < 0.9) return [253, 141, 60, 238];
+  return [215, 48, 39, 255];
+}
+
+function getRouteHeatWidth(feature) {
+  const density = Math.max(0, Math.min(1, feature?.properties?.normalizedDensity || 0));
+  return 1 + density * 5;
 }
 
 function setCanvasCursor(cursor) {
@@ -131,6 +144,8 @@ function handleDeckHover(info) {
 }
 
 function handleDeckClick(info) {
+  if (showRouteHeatmap.value) return;
+
   const object = info?.object;
   if (!object) {
     if (focusedMmsi.value) clearFocus();
@@ -144,12 +159,26 @@ function handleDeckClick(info) {
 function renderDeckLayers() {
   if (!deckOverlay) return;
 
+  if (showRouteHeatmap.value) {
+    deckOverlay.setProps({
+      layers: [
+        new GeoJsonLayer({
+          id: 'route-segments',
+          data: routeSegments,
+          pickable: false,
+          stroked: true,
+          filled: false,
+          lineWidthUnits: 'pixels',
+          getLineColor: getRouteHeatColor,
+          getLineWidth: getRouteHeatWidth,
+          parameters: { depthTest: false }
+        })
+      ]
+    });
+    return;
+  }
+
   const lines = decorateCollection(rawData.lines);
-  const points = decorateCollection(rawData.points);
-  const hasFocus = Boolean(focusedMmsi.value);
-  const visiblePoints = hasFocus
-    ? points.features.filter((feature) => feature.properties?.isFocused)
-    : points.features;
 
   deckOverlay.setProps({
     layers: [
@@ -172,22 +201,6 @@ function renderDeckLayers() {
         lineWidthUnits: 'pixels',
         getLineColor: (feature) => getDeckColor(feature, 220),
         getLineWidth: (feature) => (feature.properties?.isFocused ? 3.6 : 2),
-        onHover: handleDeckHover,
-        onClick: handleDeckClick,
-        parameters: { depthTest: false }
-      }),
-      new ScatterplotLayer({
-        id: 'track-points',
-        data: visiblePoints,
-        pickable: true,
-        radiusUnits: 'pixels',
-        getPosition: getPointCoordinates,
-        getRadius: (feature) => (feature.properties?.isFocused ? 4.6 : 3),
-        getFillColor: (feature) => getDeckColor(feature, 225),
-        getLineColor: [255, 255, 255, 230],
-        getLineWidth: (feature) => (feature.properties?.isFocused ? 1.4 : 0.8),
-        lineWidthUnits: 'pixels',
-        stroked: true,
         onHover: handleDeckHover,
         onClick: handleDeckClick,
         parameters: { depthTest: false }
@@ -324,6 +337,56 @@ async function loadTracks() {
   }
 }
 
+async function loadRouteSegments() {
+  if (!mapReady.value) return;
+  validateTimeWindow();
+
+  const requestId = ++currentRequest;
+  loading.value = true;
+  error.value = '';
+
+  try {
+    const response = await fetch(apiUrl(`/api/route-segments?${currentWindowParams().toString()}`));
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new Error(detail?.error || `航线热力数据加载失败: ${response.status}`);
+    }
+
+    const data = await response.json();
+    if (requestId !== currentRequest) return;
+
+    routeSegments = data.segments || emptyCollection();
+    summary.value = data.summary;
+    applyRenderedData();
+  } catch (err) {
+    if (requestId === currentRequest) {
+      error.value = err.message || String(err);
+      routeSegments = emptyCollection();
+      summary.value = null;
+      applyRenderedData();
+    }
+  } finally {
+    if (requestId === currentRequest) {
+      loading.value = false;
+    }
+  }
+}
+
+async function loadCurrentVisualization() {
+  if (showRouteHeatmap.value) {
+    await loadRouteSegments();
+    return;
+  }
+
+  await loadTracks();
+}
+
+async function toggleRouteHeatmap() {
+  showRouteHeatmap.value = !showRouteHeatmap.value;
+  setCanvasCursor('');
+  await loadCurrentVisualization();
+}
+
 async function searchShips() {
   const keyword = searchQuery.value.trim();
   searchError.value = '';
@@ -370,14 +433,14 @@ function selectSearchResult(result) {
   const isSame = focusedMmsi.value === result.mmsi;
   focusedMmsi.value = isSame ? '' : result.mmsi;
   applyRenderedData();
-  if (!isSame) {
+  if (!isSame && !showRouteHeatmap.value) {
     const bbox = getMmsiBbox(result.mmsi);
     fitToBbox(bbox);
   }
 }
 
 async function applyTimeWindow() {
-  await loadTracks();
+  await loadCurrentVisualization();
   if (searchQuery.value.trim()) {
     await searchShips();
   } else {
@@ -415,7 +478,7 @@ onMounted(async () => {
 
     try {
       await loadBounds();
-      await loadTracks();
+      await loadCurrentVisualization();
     } catch (err) {
       error.value = err.message || String(err);
     }
@@ -463,6 +526,16 @@ onBeforeUnmount(() => {
       <div v-if="timeWindowLabel" class="meta-text">当前时间范围：{{ timeWindowLabel }}</div>
 
       <div class="search-panel">
+        <label class="field-label">显示内容</label>
+        <button
+          type="button"
+          class="toggle-button"
+          :class="{ active: showRouteHeatmap }"
+          @click="toggleRouteHeatmap"
+        >
+          航线热力
+        </button>
+
         <label class="field-label" for="ship-search">船舶查询</label>
         <div class="search-row">
           <input
@@ -500,8 +573,11 @@ onBeforeUnmount(() => {
         </ul>
       </div>
 
-      <div v-if="summary" class="meta-text">
+      <div v-if="summary && !showRouteHeatmap" class="meta-text">
         当前显示 {{ formatNumber(summary.lines) }} 条轨迹线，{{ formatNumber(summary.rows) }} 个轨迹点
+      </div>
+      <div v-else-if="summary" class="meta-text">
+        当前显示 {{ formatNumber(summary.segments) }} 条热力线段，最大密度 {{ summary.maxDensity?.toFixed?.(2) || '-' }}
       </div>
       <div v-if="loading" class="meta-text">正在加载轨迹数据...</div>
       <div v-if="error" class="error-text">{{ error }}</div>

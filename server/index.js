@@ -20,6 +20,9 @@ if (!existsSync(dbPath)) {
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const app = express();
 const trackTables = getTrackTables();
+const routeDensityBandwidth = 150;
+const routeDensityRadius = 450;
+const earthRadiusMeters = 6378137;
 
 app.use(cors());
 app.use(compression());
@@ -45,6 +48,136 @@ function colorForMmsi(mmsi) {
   }
   const hue = hash % 360;
   return `hsl(${hue}, 78%, 52%)`;
+}
+
+function lonLatToMeters(lon, lat) {
+  const x = earthRadiusMeters * (lon * Math.PI / 180);
+  const y = earthRadiusMeters * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2));
+  return [x, y];
+}
+
+function gridKey(x, y, cellSize) {
+  return `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
+}
+
+function addToGrid(grid, segment, cellSize) {
+  const key = gridKey(segment.midX, segment.midY, cellSize);
+  const bucket = grid.get(key);
+  if (bucket) {
+    bucket.push(segment);
+    return;
+  }
+  grid.set(key, [segment]);
+}
+
+function nearbyBuckets(grid, x, y, cellSize, radius) {
+  const centerX = Math.floor(x / cellSize);
+  const centerY = Math.floor(y / cellSize);
+  const range = Math.ceil(radius / cellSize);
+  const buckets = [];
+
+  for (let gx = centerX - range; gx <= centerX + range; gx += 1) {
+    for (let gy = centerY - range; gy <= centerY + range; gy += 1) {
+      const bucket = grid.get(`${gx}:${gy}`);
+      if (bucket) buckets.push(bucket);
+    }
+  }
+
+  return buckets;
+}
+
+function createRouteSegments(rows) {
+  const segments = [];
+  let previous = null;
+
+  for (const row of rows) {
+    const lon = Number(row.zbjd);
+    const lat = Number(row.zbwd);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+    const current = {
+      mmsi: String(row.mmsi),
+      time: row.jssj,
+      coordinate: [lon, lat]
+    };
+
+    if (previous && previous.mmsi === current.mmsi) {
+      const midpoint = [
+        (previous.coordinate[0] + current.coordinate[0]) / 2,
+        (previous.coordinate[1] + current.coordinate[1]) / 2
+      ];
+      const [midX, midY] = lonLatToMeters(midpoint[0], midpoint[1]);
+
+      segments.push({
+        mmsi: current.mmsi,
+        fromTime: previous.time,
+        toTime: current.time,
+        coordinates: [previous.coordinate, current.coordinate],
+        midpoint,
+        midX,
+        midY,
+        density: 0,
+        normalizedDensity: 0
+      });
+    }
+
+    previous = current;
+  }
+
+  return segments;
+}
+
+function applyRouteDensity(segments, bandwidth = routeDensityBandwidth, radius = routeDensityRadius) {
+  const grid = new Map();
+  const radiusSq = radius * radius;
+  const bandwidthFactor = 2 * bandwidth * bandwidth;
+  let maxDensity = 0;
+
+  for (const segment of segments) {
+    addToGrid(grid, segment, radius);
+  }
+
+  for (const segment of segments) {
+    let density = 0;
+    const buckets = nearbyBuckets(grid, segment.midX, segment.midY, radius, radius);
+
+    for (const bucket of buckets) {
+      for (const candidate of bucket) {
+        const dx = segment.midX - candidate.midX;
+        const dy = segment.midY - candidate.midY;
+        const distanceSq = dx * dx + dy * dy;
+        if (distanceSq > radiusSq) continue;
+        density += Math.exp(-distanceSq / bandwidthFactor);
+      }
+    }
+
+    segment.density = density;
+    maxDensity = Math.max(maxDensity, density);
+  }
+
+  const maxLogDensity = Math.log1p(maxDensity);
+  for (const segment of segments) {
+    segment.normalizedDensity = maxLogDensity ? Math.log1p(segment.density) / maxLogDensity : 0;
+  }
+
+  return { cells: grid.size, maxDensity };
+}
+
+function routeSegmentFeature(segment) {
+  return {
+    type: 'Feature',
+    geometry: {
+      type: 'LineString',
+      coordinates: segment.coordinates
+    },
+    properties: {
+      mmsi: segment.mmsi,
+      fromTime: segment.fromTime,
+      toTime: segment.toTime,
+      density: segment.density,
+      normalizedDensity: segment.normalizedDensity
+    }
+  };
 }
 
 function shiftDate(date, days) {
@@ -348,6 +481,79 @@ app.get('/api/tracks', (req, res, next) => {
           dbRows: rows.length,
           pointFeatures: pointFeatures.length,
           lineFeatures: lineFeatures.length
+        })
+      );
+    });
+
+    res.json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/route-segments', (req, res, next) => {
+  try {
+    const requestStart = performance.now();
+    const window = getTimeWindow(req);
+    const tables = getTrackTablesForWindow(window);
+    const params = [];
+    const timeClause = buildTimeClause('l', window, params);
+
+    const sqlStart = performance.now();
+    const rows = db
+      .prepare(
+        `SELECT
+          l.mmsi,
+          l.jssj,
+          l.zbjd,
+          l.zbwd
+        FROM (${sourceSql(tables)}) l
+        WHERE l.zbjd IS NOT NULL
+          AND l.zbwd IS NOT NULL
+          AND l.zbjd BETWEEN -180 AND 180
+          AND l.zbwd BETWEEN -90 AND 90${timeClause}
+        ORDER BY l.mmsi, l.jssj`
+      )
+      .all(...params);
+    const sqlMs = performance.now() - sqlStart;
+
+    const segmentStart = performance.now();
+    const segments = createRouteSegments(rows);
+    const segmentMs = performance.now() - segmentStart;
+
+    const densityStart = performance.now();
+    const densitySummary = applyRouteDensity(segments);
+    const densityMs = performance.now() - densityStart;
+
+    const payload = {
+      window,
+      summary: {
+        rows: rows.length,
+        segments: segments.length,
+        cells: densitySummary.cells,
+        maxDensity: densitySummary.maxDensity,
+        bandwidth: routeDensityBandwidth,
+        radius: routeDensityRadius
+      },
+      segments: {
+        type: 'FeatureCollection',
+        features: segments.map(routeSegmentFeature)
+      }
+    };
+    const responseStart = performance.now();
+
+    res.once('finish', () => {
+      console.log(
+        JSON.stringify({
+          route: '/api/route-segments',
+          tables,
+          sqlMs: Math.round(sqlMs),
+          segmentMs: Math.round(segmentMs),
+          densityMs: Math.round(densityMs),
+          responseMs: Math.round(performance.now() - responseStart),
+          totalMs: Math.round(performance.now() - requestStart),
+          dbRows: rows.length,
+          segments: segments.length
         })
       );
     });
