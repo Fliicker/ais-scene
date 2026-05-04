@@ -19,6 +19,7 @@ if (!existsSync(dbPath)) {
 
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const app = express();
+const trackTables = getTrackTables();
 
 app.use(cors());
 app.use(compression());
@@ -46,8 +47,35 @@ function colorForMmsi(mmsi) {
   return `hsl(${hue}, 78%, 52%)`;
 }
 
-function sourceSql() {
-  const tables = getTrackTables();
+function shiftDate(date, days) {
+  const nextDate = new Date(`${date}T00:00:00Z`);
+  nextDate.setUTCDate(nextDate.getUTCDate() + days);
+  return nextDate.toISOString().slice(0, 10);
+}
+
+function getTableDate(table) {
+  const match = table.match(/^locus(\d{4})(\d{2})(\d{2})$/);
+  if (!match) return null;
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function getTrackTablesForWindow(window) {
+  if (!window.start && !window.end) return trackTables;
+
+  const startDate = window.start ? shiftDate(window.start.slice(0, 10), -1) : null;
+  const endDate = window.end ? window.end.slice(0, 10) : null;
+
+  return trackTables.filter((table) => {
+    const tableDate = getTableDate(table);
+    if (!tableDate) return false;
+    if (startDate && tableDate < startDate) return false;
+    if (endDate && tableDate > endDate) return false;
+    return true;
+  });
+}
+
+function sourceSql(tables = trackTables) {
+  if (!tables.length) return `SELECT * FROM ${q(trackTables[0])} WHERE 0`;
   return tables.map((table) => `SELECT * FROM ${q(table)}`).join(' UNION ALL ');
 }
 
@@ -131,6 +159,7 @@ app.get('/api/ships/search', (req, res, next) => {
     }
 
     const window = getTimeWindow(req);
+    const tables = getTrackTablesForWindow(window);
     const like = `%${keyword.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
     const params = [like, like, like];
     const timeClause = buildTimeClause('l', window, params);
@@ -143,7 +172,7 @@ app.get('/api/ships/search', (req, res, next) => {
           COUNT(*) AS pointCount,
           MIN(l.jssj) AS minTime,
           MAX(l.jssj) AS maxTime
-        FROM (${sourceSql()}) l
+        FROM (${sourceSql(tables)}) l
         LEFT JOIN ship s ON s.mmsi = l.mmsi
         WHERE (
           l.mmsi LIKE ? ESCAPE '\\'
@@ -164,10 +193,13 @@ app.get('/api/ships/search', (req, res, next) => {
 
 app.get('/api/tracks', (req, res, next) => {
   try {
+    const requestStart = performance.now();
     const window = getTimeWindow(req);
+    const tables = getTrackTablesForWindow(window);
     const params = [];
     const timeClause = buildTimeClause('l', window, params);
 
+    const sqlStart = performance.now();
     const rows = db
       .prepare(
         `SELECT
@@ -180,7 +212,7 @@ app.get('/api/tracks', (req, res, next) => {
           l.cbcs,
           l.class_type AS classType,
           COALESCE(NULLIF(s.zwmc, ''), NULLIF(s.cbmc, ''), l.mmsi) AS shipName
-        FROM (${sourceSql()}) l
+        FROM (${sourceSql(tables)}) l
         LEFT JOIN ship s ON s.mmsi = l.mmsi
         WHERE l.zbjd IS NOT NULL
           AND l.zbwd IS NOT NULL
@@ -189,7 +221,9 @@ app.get('/api/tracks', (req, res, next) => {
         ORDER BY l.mmsi, l.jssj`
       )
       .all(...params);
+    const sqlMs = performance.now() - sqlStart;
 
+    const buildStart = performance.now();
     const ships = new Map();
     const pointFeatures = [];
     let minLon = Infinity;
@@ -284,7 +318,7 @@ app.get('/api/tracks', (req, res, next) => {
         ? [minLon, minLat, maxLon, maxLat]
         : null;
 
-    res.json({
+    const payload = {
       window,
       summary: {
         rows: pointFeatures.length,
@@ -298,7 +332,27 @@ app.get('/api/tracks', (req, res, next) => {
       lines: { type: 'FeatureCollection', features: lineFeatures },
       points: { type: 'FeatureCollection', features: pointFeatures },
       labels: { type: 'FeatureCollection', features: labelFeatures }
+    };
+    const buildMs = performance.now() - buildStart;
+    const responseStart = performance.now();
+
+    res.once('finish', () => {
+      console.log(
+        JSON.stringify({
+          route: '/api/tracks',
+          tables,
+          sqlMs: Math.round(sqlMs),
+          buildMs: Math.round(buildMs),
+          responseMs: Math.round(performance.now() - responseStart),
+          totalMs: Math.round(performance.now() - requestStart),
+          dbRows: rows.length,
+          pointFeatures: pointFeatures.length,
+          lineFeatures: lineFeatures.length
+        })
+      );
     });
+
+    res.json(payload);
   } catch (error) {
     next(error);
   }

@@ -261,26 +261,6 @@ body {
   color: #a12622;
 }
 
-.mapboxgl-popup-content {
-  min-width: 190px;
-  padding: 10px 12px;
-  border-radius: 6px;
-  box-shadow: 0 10px 26px rgba(17, 28, 42, 0.22);
-}
-
-.popup-title {
-  margin-bottom: 5px;
-  color: #152033;
-  font-size: 14px;
-  font-weight: 750;
-}
-
-.popup-row {
-  color: #4f5f72;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
 @media (max-width: 640px) {
   .control-panel {
     top: 10px;

@@ -1,4 +1,6 @@
 <script setup>
+import { MapboxOverlay } from '@deck.gl/mapbox';
+import { GeoJsonLayer, ScatterplotLayer } from '@deck.gl/layers';
 import mapboxgl from 'mapbox-gl';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 
@@ -23,7 +25,6 @@ const mapEl = ref(null);
 const startTime = ref('');
 const endTime = ref('');
 const bounds = ref(null);
-const viewMode = ref('tracks');
 const loading = ref(false);
 const error = ref('');
 const summary = ref(null);
@@ -35,7 +36,7 @@ const searchLoading = ref(false);
 const searchError = ref('');
 
 let map = null;
-let popup = null;
+let deckOverlay = null;
 let currentRequest = 0;
 let currentSearchRequest = 0;
 let hasAppliedInitialView = false;
@@ -45,12 +46,6 @@ const rawData = {
   points: emptyCollection(),
   labels: emptyCollection()
 };
-
-const viewModes = [
-  { value: 'tracks', label: '轨迹' },
-  { value: 'heatmap', label: '热力' },
-  { value: 'hybrid', label: '叠加' }
-];
 
 const timeWindowLabel = computed(() => {
   if (!startTime.value || !endTime.value) return '';
@@ -83,7 +78,7 @@ function decorateCollection(collection) {
     type: 'FeatureCollection',
     features: (collection?.features || []).map((feature) => {
       const nextFeature = cloneFeature(feature);
-      const mmsi = nextFeature.properties?.mmsi || '';
+      const mmsi = String(nextFeature.properties?.mmsi || '');
       nextFeature.properties.isFocused = hasFocus && mmsi === focusedMmsi.value;
       nextFeature.properties.isDimmed = hasFocus && mmsi !== focusedMmsi.value;
       return nextFeature;
@@ -91,87 +86,118 @@ function decorateCollection(collection) {
   };
 }
 
-function setSourceData(id, data) {
-  const source = map?.getSource(id);
-  if (source) source.setData(data || emptyCollection());
+function hslToRgb(hue, saturation, lightness) {
+  const s = saturation / 100;
+  const l = lightness / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = l - c / 2;
+  let rgb = [0, 0, 0];
+
+  if (hue < 60) rgb = [c, x, 0];
+  else if (hue < 120) rgb = [x, c, 0];
+  else if (hue < 180) rgb = [0, c, x];
+  else if (hue < 240) rgb = [0, x, c];
+  else if (hue < 300) rgb = [x, 0, c];
+  else rgb = [c, 0, x];
+
+  return rgb.map((channel) => Math.round((channel + m) * 255));
 }
 
-function setLayerVisibility(id, visible) {
-  if (map?.getLayer(id)) {
-    map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none');
+function parseColor(color, alpha = 255) {
+  const match = String(color || '').match(/^hsl\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)%,\s*(\d+(?:\.\d+)?)%\)$/);
+  if (!match) return [25, 118, 210, alpha];
+  const [, hue, saturation, lightness] = match;
+  return [...hslToRgb(Number(hue) % 360, Number(saturation), Number(lightness)), alpha];
+}
+
+function getDeckColor(feature, fallbackAlpha = 220) {
+  const properties = feature?.properties || {};
+  if (properties.isDimmed) return parseColor(properties.color, 24);
+  if (properties.isFocused) return parseColor(properties.color, 245);
+  return parseColor(properties.color, fallbackAlpha);
+}
+
+function getPointCoordinates(feature) {
+  return feature?.geometry?.coordinates || null;
+}
+
+function setCanvasCursor(cursor) {
+  if (map) map.getCanvas().style.cursor = cursor;
+}
+
+function handleDeckHover(info) {
+  setCanvasCursor(info.object ? 'pointer' : '');
+}
+
+function handleDeckClick(info) {
+  const object = info?.object;
+  if (!object) {
+    if (focusedMmsi.value) clearFocus();
+    return;
   }
+
+  const mmsi = object.properties?.mmsi;
+  if (mmsi) setFocusMmsi(String(mmsi));
 }
 
-function applyViewMode() {
-  if (!map?.getLayer('track-lines')) return;
+function renderDeckLayers() {
+  if (!deckOverlay) return;
 
-  const showTracks = viewMode.value !== 'heatmap';
-  const showHeatmap = viewMode.value !== 'tracks';
+  const lines = decorateCollection(rawData.lines);
+  const points = decorateCollection(rawData.points);
+  const hasFocus = Boolean(focusedMmsi.value);
+  const visiblePoints = hasFocus
+    ? points.features.filter((feature) => feature.properties?.isFocused)
+    : points.features;
 
-  setLayerVisibility('track-lines-glow', showTracks);
-  setLayerVisibility('track-lines', showTracks);
-  setLayerVisibility('track-points', showTracks);
-  setLayerVisibility('ship-labels', showTracks);
-  setLayerVisibility('track-heatmap', showHeatmap);
-
-  if (map.getLayer('track-heatmap')) {
-    map.setPaintProperty('track-heatmap', 'heatmap-opacity', viewMode.value === 'hybrid' ? 0.58 : 0.9);
-  }
-}
-
-function applyLayerFilters() {
-  if (!map?.getLayer('track-points')) return;
-  const focusFilter = focusedMmsi.value ? ['==', ['get', 'mmsi'], focusedMmsi.value] : null;
-  map.setFilter('track-points', focusFilter);
-  if (map.getLayer('track-heatmap')) map.setFilter('track-heatmap', focusFilter);
+  deckOverlay.setProps({
+    layers: [
+      new GeoJsonLayer({
+        id: 'track-lines-glow',
+        data: lines,
+        stroked: true,
+        filled: false,
+        lineWidthUnits: 'pixels',
+        getLineColor: (feature) => getDeckColor(feature, feature.properties?.isFocused ? 68 : 42),
+        getLineWidth: (feature) => (feature.properties?.isFocused ? 8 : 5),
+        parameters: { depthTest: false }
+      }),
+      new GeoJsonLayer({
+        id: 'track-lines',
+        data: lines,
+        pickable: true,
+        stroked: true,
+        filled: false,
+        lineWidthUnits: 'pixels',
+        getLineColor: (feature) => getDeckColor(feature, 220),
+        getLineWidth: (feature) => (feature.properties?.isFocused ? 3.6 : 2),
+        onHover: handleDeckHover,
+        onClick: handleDeckClick,
+        parameters: { depthTest: false }
+      }),
+      new ScatterplotLayer({
+        id: 'track-points',
+        data: visiblePoints,
+        pickable: true,
+        radiusUnits: 'pixels',
+        getPosition: getPointCoordinates,
+        getRadius: (feature) => (feature.properties?.isFocused ? 4.6 : 3),
+        getFillColor: (feature) => getDeckColor(feature, 225),
+        getLineColor: [255, 255, 255, 230],
+        getLineWidth: (feature) => (feature.properties?.isFocused ? 1.4 : 0.8),
+        lineWidthUnits: 'pixels',
+        stroked: true,
+        onHover: handleDeckHover,
+        onClick: handleDeckClick,
+        parameters: { depthTest: false }
+      })
+    ]
+  });
 }
 
 function applyRenderedData() {
-  setSourceData('track-lines', decorateCollection(rawData.lines));
-  setSourceData('track-points', decorateCollection(rawData.points));
-  setSourceData('ship-labels', decorateCollection(rawData.labels));
-  applyLayerFilters();
-  applyViewMode();
-}
-
-function getLinePopupHtml(properties) {
-  return `<div class="popup-title">${properties.shipName || properties.mmsi}</div>
-    <div class="popup-row">MMSI: ${properties.mmsi}</div>`;
-}
-
-function getPointPopupHtml(properties) {
-  return `<div class="popup-title">${properties.shipName || properties.mmsi}</div>
-    <div class="popup-row">MMSI: ${properties.mmsi}</div>
-    <div class="popup-row">时间: ${properties.time || '-'}</div>
-    <div class="popup-row">航速: ${properties.speed ?? '-'} 航向: ${properties.heading ?? '-'}</div>`;
-}
-
-function canShowPopup(properties) {
-  if (viewMode.value === 'heatmap') return false;
-  if (!focusedMmsi.value) return true;
-  return properties?.mmsi === focusedMmsi.value;
-}
-
-function updatePopup(event, html) {
-  const coordinates = event.lngLat?.toArray?.() || event.features?.[0]?.geometry?.coordinates?.slice?.() || [];
-  if (!coordinates.length) return;
-  popup.setLngLat(coordinates).setHTML(html).addTo(map);
-}
-
-function getPreferredFeature(point) {
-  if (!map || viewMode.value === 'heatmap') return null;
-
-  const pointFeature = map.queryRenderedFeatures(point, { layers: ['track-points'] })[0];
-  if (pointFeature && canShowPopup(pointFeature.properties)) {
-    return { type: 'point', feature: pointFeature };
-  }
-
-  const lineFeature = map.queryRenderedFeatures(point, { layers: ['track-lines'] })[0];
-  if (lineFeature && canShowPopup(lineFeature.properties)) {
-    return { type: 'line', feature: lineFeature };
-  }
-
-  return null;
+  renderDeckLayers();
 }
 
 function setFocusMmsi(mmsi) {
@@ -214,13 +240,6 @@ function fitToBbox(bbox) {
   );
 }
 
-function setViewMode(nextMode) {
-  viewMode.value = nextMode;
-  applyViewMode();
-  popup?.remove();
-  if (map) map.getCanvas().style.cursor = '';
-}
-
 function validateTimeWindow() {
   if (!startTime.value || !endTime.value) {
     throw new Error('请选择开始时间和结束时间。');
@@ -237,131 +256,10 @@ function currentWindowParams() {
   });
 }
 
-function addMapLayers() {
+function addDeckOverlay() {
   if (!map) return;
-
-  map.addSource('track-lines', { type: 'geojson', data: emptyCollection() });
-  map.addSource('track-points', { type: 'geojson', data: emptyCollection() });
-  map.addSource('ship-labels', { type: 'geojson', data: emptyCollection() });
-
-  map.addLayer({
-    id: 'track-lines-glow',
-    type: 'line',
-    source: 'track-lines',
-    paint: {
-      'line-color': ['get', 'color'],
-      'line-width': ['case', ['get', 'isFocused'], 8, 5],
-      'line-opacity': ['case', ['get', 'isDimmed'], 0.025, ['get', 'isFocused'], 0.24, 0.18]
-    }
-  });
-
-  map.addLayer({
-    id: 'track-lines',
-    type: 'line',
-    source: 'track-lines',
-    paint: {
-      'line-color': ['get', 'color'],
-      'line-width': ['case', ['get', 'isFocused'], 3.4, 2],
-      'line-opacity': ['case', ['get', 'isDimmed'], 0.06, ['get', 'isFocused'], 0.96, 0.82]
-    }
-  });
-
-  map.addLayer({
-    id: 'track-points',
-    type: 'circle',
-    source: 'track-points',
-    paint: {
-      'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 2.2, 14, 4.6],
-      'circle-color': ['get', 'color'],
-      'circle-opacity': ['case', ['get', 'isFocused'], 0.94, 0.88],
-      'circle-stroke-color': '#ffffff',
-      'circle-stroke-width': ['case', ['get', 'isFocused'], 1.2, 0.8]
-    }
-  });
-
-  map.addLayer({
-    id: 'track-heatmap',
-    type: 'heatmap',
-    source: 'track-points',
-    paint: {
-      'heatmap-weight': ['interpolate', ['linear'], ['zoom'], 0, 0.6, 10, 0.9, 16, 1],
-      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 0.65, 8, 0.9, 13, 1.15],
-      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 4, 8, 10, 12, 16, 15, 22],
-      'heatmap-opacity': 0.58,
-      'heatmap-color': [
-        'interpolate',
-        ['linear'],
-        ['heatmap-density'],
-        0,
-        'rgba(45, 117, 229, 0)',
-        0.2,
-        'rgba(54, 153, 255, 0.22)',
-        0.45,
-        'rgba(68, 201, 156, 0.32)',
-        0.68,
-        'rgba(255, 206, 84, 0.42)',
-        0.84,
-        'rgba(255, 128, 0, 0.52)',
-        0.94,
-        'rgba(220, 45, 45, 0.68)',
-        1,
-        'rgba(180, 20, 20, 0.78)'
-      ]
-    }
-  });
-
-  map.addLayer({
-    id: 'ship-labels',
-    type: 'symbol',
-    source: 'ship-labels',
-    layout: {
-      'text-field': ['get', 'shipName'],
-      'text-size': ['interpolate', ['linear'], ['zoom'], 8, 10, 13, 13],
-      'text-offset': [0.8, 0.2],
-      'text-anchor': 'left',
-      'text-allow-overlap': false
-    },
-    paint: {
-      'text-color': '#101827',
-      'text-halo-color': '#ffffff',
-      'text-halo-width': 1.4,
-      'text-opacity': ['case', ['get', 'isDimmed'], 0.1, 1]
-    }
-  });
-
-  applyViewMode();
-
-  map.on('mousemove', (event) => {
-    const hit = getPreferredFeature(event.point);
-    if (!hit) {
-      map.getCanvas().style.cursor = '';
-      popup?.remove();
-      return;
-    }
-
-    map.getCanvas().style.cursor = 'pointer';
-    if (hit.type === 'point') {
-      updatePopup(event, getPointPopupHtml(hit.feature.properties));
-      return;
-    }
-    updatePopup(event, getLinePopupHtml(hit.feature.properties));
-  });
-
-  map.on('mouseout', () => {
-    map.getCanvas().style.cursor = '';
-    popup?.remove();
-  });
-
-  map.on('click', (event) => {
-    const hit = getPreferredFeature(event.point);
-    if (!hit) {
-      if (focusedMmsi.value) clearFocus();
-      return;
-    }
-
-    const mmsi = hit.feature?.properties?.mmsi;
-    if (mmsi) setFocusMmsi(mmsi);
-  });
+  deckOverlay = new MapboxOverlay({ interleaved: false, layers: [] });
+  map.addControl(deckOverlay);
 }
 
 async function loadBounds() {
@@ -495,7 +393,6 @@ onMounted(async () => {
   }
 
   mapboxgl.accessToken = mapboxToken;
-  popup = new mapboxgl.Popup({ closeButton: false, closeOnClick: false, offset: 12 });
 
   map = new mapboxgl.Map({
     container: mapEl.value,
@@ -507,9 +404,12 @@ onMounted(async () => {
 
   map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'bottom-right');
   map.addControl(new mapboxgl.ScaleControl({ maxWidth: 120, unit: 'metric' }), 'bottom-left');
+  map.on('mouseout', () => {
+    setCanvasCursor('');
+  });
 
   map.once('load', async () => {
-    addMapLayers();
+    addDeckOverlay();
     mapReady.value = true;
     await nextTick();
 
@@ -523,7 +423,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  popup?.remove();
+  if (deckOverlay && map) map.removeControl(deckOverlay);
   map?.remove();
 });
 </script>
@@ -563,20 +463,6 @@ onBeforeUnmount(() => {
       <div v-if="timeWindowLabel" class="meta-text">当前时间范围：{{ timeWindowLabel }}</div>
 
       <div class="search-panel">
-        <label class="field-label">显示模式</label>
-        <div class="mode-switch" role="tablist" aria-label="显示模式">
-          <button
-            v-for="mode in viewModes"
-            :key="mode.value"
-            type="button"
-            class="mode-button"
-            :class="{ active: viewMode === mode.value }"
-            @click="setViewMode(mode.value)"
-          >
-            {{ mode.label }}
-          </button>
-        </div>
-
         <label class="field-label" for="ship-search">船舶查询</label>
         <div class="search-row">
           <input
